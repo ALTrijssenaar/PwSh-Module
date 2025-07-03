@@ -1,0 +1,176 @@
+name: Publish to PowerShell Gallery
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 1.0.0)'
+        required: true
+        type: string
+
+env:
+  POWERSHELL_TELEMETRY_OPTOUT: 1
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup PowerShell
+      uses: microsoft/powershell@v1
+
+    - name: Determine Version
+      id: version
+      shell: pwsh
+      run: |
+        if ('${{ github.event_name }}' -eq 'release') {
+          $version = '${{ github.event.release.tag_name }}' -replace '^v', ''
+        } else {
+          $version = '${{ inputs.version }}'
+        }
+        
+        if (-not $version) {
+          Write-Error "Version not determined"
+          exit 1
+        }
+        
+        # Validate version format (SemVer)
+        if ($version -notmatch '^\d+\.\d+\.\d+(-[a-zA-Z0-9\-\.]+)?$') {
+          Write-Error "Invalid version format: $version"
+          exit 1
+        }
+        
+        Write-Host "Version: $version"
+        echo "version=$version" >> $env:GITHUB_OUTPUT
+
+    - name: Update Module Version
+      shell: pwsh
+      run: |
+        $version = '${{ steps.version.outputs.version }}'
+        $manifestPath = './src/PwSh-Module.psd1'
+        
+        # Read and update manifest
+        $manifest = Get-Content $manifestPath -Raw
+        $manifest = $manifest -replace "ModuleVersion\s*=\s*'[^']*'", "ModuleVersion = '$version'"
+        Set-Content -Path $manifestPath -Value $manifest
+        
+        Write-Host "Updated module version to: $version"
+
+    - name: Install Required Modules
+      shell: pwsh
+      run: |
+        Set-PSRepository PSGallery -InstallationPolicy Trusted
+        Install-Module -Name Pester -MinimumVersion 5.0.0 -Force -Scope CurrentUser
+        Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+
+    - name: Run Tests
+      shell: pwsh
+      run: |
+        # Run PSScriptAnalyzer
+        $analysisResults = Invoke-ScriptAnalyzer -Path ./src -Recurse
+        if ($analysisResults.Count -gt 0) {
+          $analysisResults | Format-Table -AutoSize
+          Write-Error "PSScriptAnalyzer found issues"
+          exit 1
+        }
+        
+        # Run Pester tests
+        $config = New-PesterConfiguration
+        $config.Run.Path = './tests'
+        $config.Output.Verbosity = 'Normal'
+        
+        $result = Invoke-Pester -Configuration $config
+        if ($result.Failed.Count -gt 0) {
+          Write-Error "Tests failed"
+          exit 1
+        }
+
+    - name: Validate Module Manifest
+      shell: pwsh
+      run: |
+        $manifest = Test-ModuleManifest -Path ./src/PwSh-Module.psd1
+        Write-Host "Module manifest validated successfully"
+        Write-Host "Name: $($manifest.Name)"
+        Write-Host "Version: $($manifest.Version)"
+        Write-Host "GUID: $($manifest.Guid)"
+
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: module-build
+        path: src/
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: production
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup PowerShell
+      uses: microsoft/powershell@v1
+
+    - name: Download Build Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: module-build
+        path: src/
+
+    - name: Publish to PowerShell Gallery
+      shell: pwsh
+      env:
+        PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+      run: |
+        if (-not $env:PSGALLERY_API_KEY) {
+          Write-Error "PSGallery API key not found"
+          exit 1
+        }
+        
+        # Publish module
+        try {
+          Publish-Module -Path ./src -NuGetApiKey $env:PSGALLERY_API_KEY -Verbose
+          Write-Host "Module published successfully to PowerShell Gallery" -ForegroundColor Green
+        } catch {
+          Write-Error "Failed to publish module: $($_.Exception.Message)"
+          exit 1
+        }
+
+    - name: Create GitHub Release Asset
+      shell: pwsh
+      run: |
+        $version = '${{ needs.validate.outputs.version }}'
+        $zipPath = "PwSh-Module-$version.zip"
+        
+        # Create zip file
+        Compress-Archive -Path ./src/* -DestinationPath $zipPath
+        
+        Write-Host "Created release asset: $zipPath"
+        echo "ASSET_PATH=$zipPath" >> $env:GITHUB_ENV
+
+    - name: Upload Release Asset
+      if: github.event_name == 'release'
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ${{ env.ASSET_PATH }}
+        asset_name: ${{ env.ASSET_PATH }}
+        asset_content_type: application/zip
+
+    - name: Update Repository Topics
+      shell: pwsh
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # Update repository with PowerShell Gallery badge information
+        Write-Host "Module published successfully!" -ForegroundColor Green
+        Write-Host "Version: ${{ needs.validate.outputs.version }}" -ForegroundColor Green
+        Write-Host "Check PowerShell Gallery: https://www.powershellgallery.com/packages/PwSh-Module"
