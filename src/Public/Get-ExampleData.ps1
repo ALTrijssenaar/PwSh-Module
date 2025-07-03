@@ -108,7 +108,9 @@ function Get-ExampleData {
             switch ($Filter) {
                 'Active' { $ResultData = $ResultData | Where-Object { $_.Status -eq 'Active' } }
                 'Inactive' { $ResultData = $ResultData | Where-Object { $_.Status -eq 'Inactive' } }
-                'All' { # No filtering needed }
+                'All' { 
+                    # No filtering needed
+                }
                 default { 
                     Write-Warning "Invalid filter value: $Filter. Using 'All'."
                 }
